@@ -127,6 +127,8 @@ async function setupPlasma () {
 
 
   const plasmaCt = new web3.eth.Contract(abi, addr, { from: addr, gas: 7000000, gasPrice: '3000' })
+  
+  const solidityHelperAddress = '0x1000000000000000000000000000000000000000'
 
   await mineBlock()
   // Now try to deploy
@@ -140,7 +142,7 @@ async function setupPlasma () {
   // const deploymentTransaction = await web3.eth.getTransaction(block.transactions[0]) // eslint-disable-line no-unused-vars
   const weiDecimalOffset = 0 // so it'll be wei
   debugger
-  operatorSetup = await plasma.methods.setup(web3.eth.accounts.wallet[0].address, weiDecimalOffset, ser._address).send()
+  operatorSetup = await plasma.methods.setup(web3.eth.accounts.wallet[0].address, weiDecimalOffset, ser._address, solidityHelperAddress).send()
   freshContractSnapshot = await getCurrentChainSnapshot()
   return [bytecode, abi, plasma, operatorSetup, freshContractSnapshot, ser]
 }

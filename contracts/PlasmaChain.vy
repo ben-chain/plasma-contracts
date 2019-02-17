@@ -33,6 +33,10 @@ struct tokenListing:
     # address of the ERC20
     contractAddress: address
 
+contract SolidityABIHelper:
+    def encodeExit(_state: bytes[1000], _typedStart: uint256, _typedEnd: uint256, _exitHeight: uint256, _exitTime: uint256) -> bytes[1000]: constant
+    def decodePredicateFromState(_stateObject: bytes[1000]) -> address: constant
+
 contract ERC20:
     def transferFrom(_from: address, _to: address, _value: uint256) -> bool: modifying
     def transfer(_to: address, _value: uint256) -> bool: modifying
@@ -65,6 +69,9 @@ SubmitBlockEvent: event({blockNumber: indexed(uint256), submittedHash: indexed(b
 BeginExitEvent: event({tokenType: indexed(uint256), untypedStart: indexed(uint256), untypedEnd: indexed(uint256), exiter: address, exitID: uint256})
 FinalizeExitEvent: event({tokenType: indexed(uint256), untypedStart: indexed(uint256), untypedEnd: indexed(uint256), exitID: uint256, exiter: address})
 ChallengeEvent: event({exitID: uint256, challengeID: indexed(uint256)})
+
+# predicate related publics
+solidityHelperAddr: public(address)
 
 # operator related publics
 operator: public(address)
@@ -240,11 +247,13 @@ def checkTransactionProofAndGetTypedTransfer(
 ### BEGIN CONTRACT LOGIC ###
 
 @public
-def setup(_operator: address, ethDecimalOffset: uint256, serializerAddr: address): # last val should be properly hardcoded as a constant eventually
+def setup(_operator: address, ethDecimalOffset: uint256, serializerAddr: address, solidityHelper: address): # last val should be properly hardcoded as a constant eventually
+
     assert self.isSetup == False
     self.CHALLENGE_PERIOD = 20
     self.SPENTCOIN_CHALLENGE_PERIOD =  self.CHALLENGE_PERIOD / 2
 
+    self.solidityHelperAddr = solidityHelper
     
     self.operator = _operator
     self.nextPlasmaBlockNumber = 1 # starts at 1 so deposits before the first block have a precedingPlasmaBlock of 0 since it can't be negative (it's a uint)
