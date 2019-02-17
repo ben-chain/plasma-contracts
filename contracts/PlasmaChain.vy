@@ -14,7 +14,9 @@ struct Exit:
     tokenType: uint256
     untypedStart: uint256
     untypedEnd: uint256
-    challengeCount: uint256
+    challengeCount: uint256 #predicate stuff below
+    predicateAddress: address
+    exitEncoding: bytes[1000]
 
 struct inclusionChallenge:
     exitID: uint256
@@ -24,8 +26,9 @@ struct invalidHistoryChallenge:
     exitID: uint256
     coinID: uint256
     blockNumber: uint256
-    recipient: address
-    ongoing: bool
+    ongoing: bool # pred stuff below
+    predicateAddress: address
+    stateObject: bytes[1000]
 
 struct tokenListing:
     # formula: ERC20 amount = (plasma coin amount * 10^decimalOffset)
@@ -33,8 +36,13 @@ struct tokenListing:
     # address of the ERC20
     contractAddress: address
 
+contract PredicateContract:
+    def canStartExit(_exitEncoding: bytes[1000], _witness: bytes[1000]) -> bool: constant
+    def canCancel(_exitEncoding: bytes[1000], _witness: bytes[1000]) -> bool: constant
+    def doExitFinalization(_exitEncoding: bytes[1000]): modifying
+
 contract SolidityABIHelper:
-    def encodeExit(_state: bytes[1000], _typedStart: uint256, _typedEnd: uint256, _exitHeight: uint256, _exitTime: uint256) -> bytes[1000]: constant
+    def encodeExit(_state: bytes[1000], _typedStart: uint256, _typedEnd: uint256, _exitPlasmaBlock: uint256, _exitEthBlock: uint256) -> bytes[1000]: constant
     def decodePredicateFromState(_stateObject: bytes[1000]) -> address: constant
 
 contract ERC20:
@@ -346,12 +354,22 @@ def depositERC20(tokenAddress: address, depositSize: uint256):
     self.processDeposit(depositer, depositInPlasmaCoins, tokenType)
 
 @public
-def beginExit(tokenType: uint256, blockNumber: uint256, untypedStart: uint256, untypedEnd: uint256) -> uint256:
+def beginExit(tokenType: uint256, blockNumber: uint256, untypedStart: uint256, untypedEnd: uint256, stateObject: bytes[1000], witness: bytes[1000]) -> uint256:
     assert blockNumber < self.nextPlasmaBlockNumber
 
-    exiter: address = msg.sender
+    # predicate stuff
+    encodedExit: bytes[1000] = SolidityABIHelper(self.solidityHelperAddr).encodeExit(stateObject, untypedStart, untypedEnd, blockNumber, block.number) # todo type if doing ERC20
+    exitPredicate: address = SolidityABIHelper(self.solidityHelperAddr).decodePredicateFromState(stateObject)
 
+    assert PredicateContract(exitPredicate).canStartExit(encodedExit, witness)
+
+    exiter: address = msg.sender
     exitID: uint256 = self.exitNonce
+
+    # predicate stores
+    self.exits[exitID].predicateAddress = exitPredicate
+    self.exits[exitID].exitEncoding = encodedExit
+
     self.exits[exitID].exiter = exiter
     self.exits[exitID].plasmaBlockNumber = blockNumber
     self.exits[exitID].ethBlockNumber = block.number
@@ -408,16 +426,14 @@ def finalizeExit(exitID: uint256, exitableEnd: uint256):
     self.checkRangeExitable(tokenType, exitUntypedStart, exitUntypedEnd, exitableEnd)
     self.removeFromExitable(tokenType, exitUntypedStart, exitUntypedEnd, exitableEnd)
 
+    pred: address = self.exits[exitID].predicateAddress
+    exitEnc: bytes[1000] = self.exits[exitID].exitEncoding
+
     if tokenType == 0: # then we're exiting ETH
         weiMiltiplier: uint256 = 10**self.weiDecimalOffset
         exitValue: uint256 = (exitUntypedEnd - exitUntypedStart) / weiMiltiplier
-        send(exiter, as_wei_value(exitValue, "wei"))
-    else: #then we're exiting ERC
-        tokenMultiplier: uint256 = 10**self.listings[tokenType].decimalOffset
-        exitValue: uint256 = (exitUntypedEnd - exitUntypedStart) / tokenMultiplier
-        
-        passed: bool = ERC20(self.listings[tokenType].contractAddress).transfer(exiter, exitValue)
-        assert passed
+        send(pred, as_wei_value(exitValue, "wei"))
+        PredicateContract(pred).doExitFinalization(exitEnc)
 
     # log the event    
     log.FinalizeExitEvent(tokenType, exitUntypedStart, exitUntypedEnd, exitID, exiter)
@@ -448,156 +464,25 @@ def challengeBeforeDeposit(
     clear(self.exits[exitID])
 
 @public
-def challengeInclusion(exitID: uint256):
-    # check the exit being challenged exists
-    assert exitID < self.exitNonce
-
-    # check we can still challenge
-    exitethBlockNumber: uint256 = self.exits[exitID].ethBlockNumber
-    assert block.number < exitethBlockNumber + self.CHALLENGE_PERIOD
-
-    # store challenge
-    challengeID: uint256 = self.challengeNonce
-    self.inclusionChallenges[challengeID].exitID = exitID
-
-    self.inclusionChallenges[challengeID].ongoing = True
-    self.exits[exitID].challengeCount += 1
-
-    self.challengeNonce += 1
-
-    # log the event so clients can respond
-    log.ChallengeEvent(exitID, challengeID)
-
-@public
-def respondTransactionInclusion(
-        challengeID: uint256,
-        transferIndex: int128,
-        transactionEncoding: bytes[277],
-        transactionProofEncoding: bytes[4821],
-):
-    assert self.inclusionChallenges[challengeID].ongoing
-
-    transferTypedStart: uint256 # these will be the ones at the trIndex we are being asked about by the exit game
-    transferTypedEnd: uint256
-    transferRecipient: address
-    transferSender: address
-    responseBlockNumber: uint256
-
-    (
-        transferRecipient,
-        transferSender,
-        transferTypedStart, 
-        transferTypedEnd, 
-        responseBlockNumber
-    ) = self.checkTransactionProofAndGetTypedTransfer(
-        transactionEncoding,
-        transactionProofEncoding,
-        transferIndex
-    )
-
-    exitID: uint256 = self.inclusionChallenges[challengeID].exitID
-    exiter: address = self.exits[exitID].exiter
-    exitPlasmaBlockNumber: uint256 = self.exits[exitID].plasmaBlockNumber
-
-    # check exit exiter is indeed recipient
-    assert transferRecipient == exiter
-
-    # check the inclusion was indeed at this block
-    assert exitPlasmaBlockNumber == responseBlockNumber
-
-    # check the inclusion for relevant bounds
-    exitTokenType: uint256 = self.exits[exitID].tokenType
-    exitTypedStart: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.exits[exitID].untypedStart)
-    exitTypedEnd: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.exits[exitID].untypedEnd)
-
-    assert transferTypedStart >= exitTypedStart
-    assert transferTypedEnd <= exitTypedEnd
-
-    # response was successful
-    clear(self.inclusionChallenges[challengeID])
-    self.exits[exitID].challengeCount -= 1
-
-@public
-def respondDepositInclusion(
-    challengeID: uint256,
-    depositUntypedEnd: uint256
-):
-    assert self.inclusionChallenges[challengeID].ongoing
-    
-    exitID: uint256 = self.inclusionChallenges[challengeID].exitID
-    exiter: address = self.exits[exitID].exiter
-    exitPlasmaBlockNumber: uint256 = self.exits[exitID].plasmaBlockNumber
-    exitTokenType: uint256 = self.exits[exitID].tokenType
-
-    # check exit exiter is indeed recipient
-    depositer: address = self.deposits[exitTokenType][depositUntypedEnd].depositer
-    assert depositer == exiter
-
-    #check the inclusion was indeed at this block
-    depositBlockNumber: uint256 = self.deposits[exitTokenType][depositUntypedEnd].precedingPlasmaBlockNumber
-    assert exitPlasmaBlockNumber == depositBlockNumber
-
-    # chcek the inclusion was indeed within the bounds
-    exitTypedStart: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.exits[exitID].untypedStart)
-    exitTypedEnd: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.exits[exitID].untypedEnd)
-
-    depositTypedStart: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.deposits[exitTokenType][depositUntypedEnd].untypedStart)
-    depositTypedEnd: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, depositUntypedEnd)
-
-    assert depositTypedStart >= exitTypedStart
-    assert depositTypedEnd <= exitTypedEnd
-
-    # response was successful
-    clear(self.inclusionChallenges[challengeID])
-    self.exits[exitID].challengeCount -= 1
-
-@public
 def challengeSpentCoin(
     exitID: uint256,
-    coinID: uint256,
-    transferIndex: int128,
-    transactionEncoding: bytes[277],
-    transactionProofEncoding: bytes[4821],
+    witness: bytes[1000]
 ):
     # check we can still challenge
     exitethBlockNumberNumber: uint256 = self.exits[exitID].ethBlockNumber
     assert block.number < exitethBlockNumberNumber + self.SPENTCOIN_CHALLENGE_PERIOD
 
-    transferTypedStart: uint256 # these will be the ones at the trIndex we are being asked about by the exit game
-    transferTypedEnd: uint256
-    transferRecipient: address
-    transferSender: address
-    bn: uint256
-
-    (
-        transferRecipient,
-        transferSender,
-        transferTypedStart, 
-        transferTypedEnd, 
-        bn
-    ) = self.checkTransactionProofAndGetTypedTransfer(
-        transactionEncoding,
-        transactionProofEncoding,
-        transferIndex
-    )
-
     exiter: address = self.exits[exitID].exiter
     exitPlasmaBlockNumber: uint256 = self.exits[exitID].plasmaBlockNumber
     exitTokenType: uint256 = self.exits[exitID].tokenType
     exitTypedStart: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.exits[exitID].untypedStart)
     exitTypedEnd: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, self.exits[exitID].untypedEnd)
 
-    # check the coinspend came after the exit block
-    assert bn > exitPlasmaBlockNumber
-
-    # check the coinspend intersects both the exit and proven transfer
-    assert coinID >=  exitTypedStart
-    assert coinID < exitTypedEnd
-    assert coinID >= transferTypedStart
-    assert coinID < transferTypedEnd
-
-    # check the sender was the exiter
-    assert transferSender == exiter
+    pred: address = self.exits[exitID].predicateAddress
+    exitEnc: bytes[1000] = self.exits[exitID].exitEncoding
+    
+    cancelled: bool = PredicateContract(pred).canCancel(exitEnc, witness)
+    assert cancelled
 
     # if all these passed, the coin was indeed spent.  CANCEL!
     clear(self.exits[exitID])
@@ -606,10 +491,11 @@ def challengeSpentCoin(
 def challengeInvalidHistory(
     exitID: uint256,
     coinID: uint256,
-    claimant: address,
     typedStart: uint256,
     typedEnd: uint256,
-    blockNumber: uint256
+    blockNumber: uint256,
+    stateObject: bytes[1000],
+    witness: bytes[1000]
 ):
     # check we can still challenge
     exitethBlockNumberNumber: uint256 = self.exits[exitID].ethBlockNumber
@@ -633,160 +519,51 @@ def challengeInvalidHistory(
     # check the exit being challenged exists
     assert exitID < self.exitNonce
 
+    # predicate stuff
+    encodedExit: bytes[1000] = SolidityABIHelper(self.solidityHelperAddr).encodeExit(stateObject, typedStart, typedEnd, blockNumber, block.number) # todo type if doing ERC20
+    exitPredicate: address = SolidityABIHelper(self.solidityHelperAddr).decodePredicateFromState(stateObject)
+
+    assert PredicateContract(exitPredicate).canStartExit(encodedExit, witness)
+
     # get and increment challengeID
     challengeID: uint256 = self.challengeNonce
     self.exits[exitID].challengeCount += 1
     
     self.challengeNonce += 1
 
+    #store pred stuff
+    self.invalidHistoryChallenges[challengeID].predicateAddress = exitPredicate
+    self.invalidHistoryChallenges[challengeID].stateObject = encodedExit
+
     # store challenge
     self.invalidHistoryChallenges[challengeID].ongoing = True
     self.invalidHistoryChallenges[challengeID].exitID = exitID
     self.invalidHistoryChallenges[challengeID].coinID = coinID
-    self.invalidHistoryChallenges[challengeID].recipient = claimant
     self.invalidHistoryChallenges[challengeID].blockNumber = blockNumber
 
     # log the event so clients can respond
     log.ChallengeEvent(exitID, challengeID)
 
 @public
-def challengeInvalidHistoryWithTransaction(
-    exitID: uint256,
-    coinID: uint256,
-    transferIndex: int128,
-    transactionEncoding: bytes[277],
-    transactionProofEncoding: bytes[4821]
-):
-    transferTypedStart: uint256 # these will be the ones at the trIndex we are being asked about by the exit game
-    transferTypedEnd: uint256
-    transferRecipient: address
-    transferSender: address
-    bn: uint256
-    (
-        transferRecipient,
-        transferSender,
-        transferTypedStart, 
-        transferTypedEnd, 
-        bn
-    ) = self.checkTransactionProofAndGetTypedTransfer(
-        transactionEncoding,
-        transactionProofEncoding,
-        transferIndex
-    )
-
-    self.challengeInvalidHistory(
-        exitID,
-        coinID,
-        transferRecipient,
-        transferTypedStart,
-        transferTypedEnd,
-        bn
-    )
-
-@public
-def challengeInvalidHistoryWithDeposit(
-    exitID: uint256,
-    coinID: uint256,
-    depositUntypedEnd: uint256
-):
-    tokenType: uint256 = self.exits[exitID].tokenType
-    depositer: address = self.deposits[tokenType][depositUntypedEnd].depositer
-    assert depositer != ZERO_ADDRESS # make sure the deposit was really set/valid
-
-    # get typed deposit bounds
-    depositBlockNumber: uint256 = self.deposits[tokenType][depositUntypedEnd].precedingPlasmaBlockNumber
-
-   # check the coinspend intersects the exit
-    depositTypedStart: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(tokenType, self.deposits[tokenType][depositUntypedEnd].untypedStart)
-    depositTypedEnd: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(tokenType, depositUntypedEnd)
-
-    self.challengeInvalidHistory(
-        exitID,
-        coinID,
-        depositer,
-        depositTypedStart,
-        depositTypedEnd,
-        depositBlockNumber
-    )
-
-@public
-def respondInvalidHistoryTransaction(
+def respondInvalidHistory(
         challengeID: uint256,
-        transferIndex: int128,
-        transactionEncoding: bytes[277],
-        transactionProofEncoding: bytes[4821],
+        witness: bytes[1000]
 ):
     assert self.invalidHistoryChallenges[challengeID].ongoing
-
-    transferTypedStart: uint256 # these will be the ones at the trIndex we are being asked about by the exit game
-    transferTypedEnd: uint256
-    transferRecipient: address
-    transferSender: address
-    bn: uint256
-
-    (
-        transferRecipient,
-        transferSender,
-        transferTypedStart, 
-        transferTypedEnd, 
-        bn
-    ) = self.checkTransactionProofAndGetTypedTransfer(
-        transactionEncoding,
-        transactionProofEncoding,
-        transferIndex
-    )
-
-    # check the response transfer addresses the challenged coin
-    chalCoinID: uint256 = self.invalidHistoryChallenges[challengeID].coinID
-    assert chalCoinID >= transferTypedStart
-    assert chalCoinID  < transferTypedEnd
-
-    # check exit the response's sender is indeed the challenge's recipient
-    chalRecipient: address = self.invalidHistoryChallenges[challengeID].recipient
-    assert chalRecipient == transferSender
 
     # check the response was between exit and challenge
     exitID: uint256 = self.invalidHistoryChallenges[challengeID].exitID
     exitPlasmaBlockNumber: uint256 = self.exits[exitID].plasmaBlockNumber
     chalBlockNumber: uint256 = self.invalidHistoryChallenges[challengeID].blockNumber
+
+    # todo block checking figure out
+
+    # predicate stuff
+    pred: address = self.exits[exitID].predicateAddress
+    exitEnc: bytes[1000] = self.exits[exitID].exitEncoding
     
-    assert bn > chalBlockNumber
-    assert bn <= exitPlasmaBlockNumber
-
-    # response was successful
-    clear(self.invalidHistoryChallenges[challengeID])
-    self.exits[exitID].challengeCount -= 1
-
-@public
-def respondInvalidHistoryDeposit(
-    challengeID: uint256,
-    depositUntypedEnd: uint256
-):
-    assert self.invalidHistoryChallenges[challengeID].ongoing
-
-    exitID: uint256 = self.invalidHistoryChallenges[challengeID].exitID
-    exitTokenType: uint256 = self.exits[exitID].tokenType
-
-    #check the deposit is real
-    assert self.deposits[exitTokenType][depositUntypedEnd].depositer != ZERO_ADDRESS
-
-    #check the response deposit addresses the right coinID
-    chalCoinID: uint256 = self.invalidHistoryChallenges[challengeID].coinID
-    depositUntypedStart: uint256 = self.deposits[exitTokenType][depositUntypedEnd].untypedStart
-
-    depositTypedStart: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, depositUntypedStart)
-    depositTypedEnd: uint256 = Serializer(self.serializer).getTypedFromTokenAndUntyped(exitTokenType, depositUntypedEnd)
-    
-    assert chalCoinID >= depositTypedStart
-    assert chalCoinID <= depositTypedEnd
-
-    # check the response was between exit and challenge
-    chalBlockNumber: uint256 = self.invalidHistoryChallenges[challengeID].blockNumber
-    exitPlasmaBlockNumber: uint256 = self.exits[exitID].plasmaBlockNumber
-    depositBlockNumber: uint256 = self.deposits[exitTokenType][depositUntypedEnd].precedingPlasmaBlockNumber
-    
-    assert depositBlockNumber > chalBlockNumber
-    assert depositBlockNumber <= exitPlasmaBlockNumber
+    cancelled: bool = PredicateContract(pred).canCancel(exitEnc, witness)
+    assert cancelled
 
     # response was successful
     clear(self.invalidHistoryChallenges[challengeID])
